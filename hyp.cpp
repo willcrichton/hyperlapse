@@ -2,22 +2,32 @@
 #include <algorithm>
 #include <limits>
 #include <glog/logging.h>
-#include <opencv2/highgui/highgui.hpp>
-#include <opencv2/nonfree/nonfree.hpp>
-#include <opencv2/calib3d/calib3d.hpp>
+#include <opencv2/highgui.hpp>
+#include <opencv2/calib3d.hpp>
+#include <opencv2/videostab.hpp>
+#include <opencv2/xfeatures2d.hpp>
+
 #include "CycleTimer.h"
 
 using namespace std;
 using namespace cv;
+using namespace cv::videostab;
+using namespace cv::xfeatures2d;
 
-#define START(S)                                \
-  LOG(INFO) << S << "...";                      \
-  start = CycleTimer::currentSeconds();         \
-
-
-#define END {                                                           \
-    LOG(INFO) << "Done in " << CycleTimer::currentSeconds() - start << "s."; \
+class SectionTimer {
+public:
+  SectionTimer(string name) {
+    LOG(INFO) << name << "...";
+    start = CycleTimer::currentSeconds();
   }
+
+  ~SectionTimer() {
+    LOG(INFO) << "Done in " << CycleTimer::currentSeconds() - start << "s.";
+  }
+
+private:
+  double start;
+};
 
 class Constants {
 public:
@@ -27,8 +37,10 @@ public:
   int T;
   int d;
   float tau_c, gamma;
-  int lam_s = 200;
-  int lam_a = 80;
+  //int lam_s = 200;
+  //int lam_a = 80;
+  int lam_s = 100;
+  int lam_a = 40;
   int tau_s = 200;
   int tau_a = 200;
   int v = 8;
@@ -90,6 +102,12 @@ float match_cost(Constants C,
 
   Mat mask;
   Mat H = findHomography(fr1, fr2, CV_RANSAC, 3, mask);
+
+  // If H is empty, then homography could not be found
+  if (H.rows == 0) {
+    return C.gamma;
+  }
+
   float cr = reprojection_error(fr1, fr2, H);
 
   Point2f x(C.ih/2), y(C.iw/2);
@@ -97,13 +115,39 @@ float match_cost(Constants C,
   float co = reprojection_error(center, center, H);
 
   // LOG(INFO) << "cr: " << cr << ", co: " << co << ", C.tau_c: " << C.tau_c;
-
   if (cr < C.tau_c) {
     return co;
   } else {
     return C.gamma;
   }
 }
+
+class VecSource : public IFrameSource {
+public:
+  VecSource(vector<Mat>* frames) {
+    this->frames = frames;
+    reset();
+  }
+
+  virtual void reset() {
+    index = 0;
+  }
+
+  virtual Mat nextFrame() {
+    if (index == frames->size()) {
+      Mat m;
+      return m;
+    }
+
+    Mat frame = (*frames)[index];
+    index++;
+    return frame;
+  }
+
+private:
+  vector<Mat>* frames;
+  int index;
+};
 
 int main(int argc, char* argv[]) {
   google::InitGoogleLogging(argv[0]);
@@ -117,15 +161,17 @@ int main(int argc, char* argv[]) {
     exit(0);
   }
 
-  START("Loading frames");
   vector<Mat> frames;
-  while(frames.size() < 300) {
-    Mat frame;
-    if (!input.read(frame)) { break; }
-    frames.push_back(frame);
+  {
+    SectionTimer timer("Loading frames");
+    while(true) {
+      Mat frame, frame_t;
+      if (!input.read(frame)) { break; }
+      transpose(frame, frame_t);
+      frames.push_back(frame_t);
+    }
+    LOG(INFO) << "Loaded " << frames.size() << " frames.";
   }
-  LOG(INFO) << "Loaded " << frames.size() << " frames.";
-  END;
 
   Constants C(frames[0].cols, frames[0].rows, frames.size());
 
@@ -139,196 +185,174 @@ int main(int argc, char* argv[]) {
 
   vector<Mat> features;
   vector<vector<KeyPoint>> kps;
-  START("Detecting features");
-  for (int i = 0; i < C.T; i++) {
-    Mat feat;
-    vector<KeyPoint> kp;
-    features.push_back(feat);
-    kps.push_back(kp);
-  }
+  {
+    SectionTimer timer("Detecting features");
+    for (int i = 0; i < C.T; i++) {
+      Mat feat;
+      vector<KeyPoint> kp;
+      features.push_back(feat);
+      kps.push_back(kp);
+    }
 
 #pragma omp parallel
-  {
-    SurfFeatureDetector detector(400);
-    SurfDescriptorExtractor extractor;
+    {
+#if CV_MAJOR_VERSION >= 3
+      Ptr<SURF> detector = SURF::create(400);
 #pragma omp for schedule(dynamic)
-    for (int i = 0; i < frames.size(); i++) {
-      detector.detect(frames[i], kps[i]);
-      extractor.compute(frames[i], kps[i], features[i]);
+      for (int i = 0; i < frames.size(); i++) {
+        detector->detect(frames[i], kps[i]);
+        detector->compute(frames[i], kps[i], features[i]);
+      }
+#else
+      SurfFeatureDetector detector(400);
+      SurfDescriptorExtractor extractor;
+#pragma omp for schedule(dynamic)
+      for (int i = 0; i < frames.size(); i++) {
+        detector.detect(frames[i], kps[i]);
+        extractor.compute(frames[i], kps[i], features[i]);
+      }
+#endif
     }
   }
-  END;
-
-  // int a = 0;
-  // int b = 59;
-
-  // Mat img_object = frames[a],
-  //   img_scene = frames[b];
-
-  // vector<KeyPoint> keypoints_object = kps[a],
-  //   keypoints_scene = kps[b];
-
-  // Mat descriptors_object = features[a],
-  //   descriptors_scene = features[b];
-
-  // match_cost(C, keypoints_object, descriptors_object, keypoints_scene, descriptors_scene);
-
-  // //-- Step 3: Matching descriptor vectors using FLANN matcher
-  // FlannBasedMatcher matcher;
-  // std::vector< DMatch > matches;
-  // matcher.match( descriptors_object, descriptors_scene, matches );
-
-  // double max_dist = 0; double min_dist = 100;
-
-  // //-- Quick calculation of max and min distances between keypoints
-  // for( int i = 0; i < descriptors_object.rows; i++ )
-  // { double dist = matches[i].distance;
-  //   if( dist < min_dist ) min_dist = dist;
-  //   if( dist > max_dist ) max_dist = dist;
-  // }
-
-  // printf("-- Max dist : %f \n", max_dist );
-  // printf("-- Min dist : %f \n", min_dist );
-
-  // //-- Draw only "good" matches (i.e. whose distance is less than 3*min_dist )
-  // std::vector< DMatch > good_matches;
-
-  // for( int i = 0; i < descriptors_object.rows; i++ )
-  // { //if( matches[i].distance < 3*min_dist )
-  //    { good_matches.push_back( matches[i]); }
-  // }
-
-  // Mat img_matches;
-  // drawMatches( img_object, keypoints_object, img_scene, keypoints_scene,
-  //              good_matches, img_matches, Scalar::all(-1), Scalar::all(-1),
-  //              vector<char>(), DrawMatchesFlags::NOT_DRAW_SINGLE_POINTS );
-
-
-  // std::vector<Point2f> obj;
-  // std::vector<Point2f> scene;
-
-  // for( int i = 0; i < good_matches.size(); i++ )
-  // {
-  //   //-- Get the keypoints from the good matches
-  //   obj.push_back( keypoints_object[ good_matches[i].queryIdx ].pt );
-  //   scene.push_back( keypoints_scene[ good_matches[i].trainIdx ].pt );
-  // }
-
-  // Mat H = findHomography( obj, scene, CV_RANSAC );
-
-  // //-- Get the corners from the image_1 ( the object to be "detected" )
-  // std::vector<Point2f> obj_corners(4);
-  // obj_corners[0] = cvPoint(0,0); obj_corners[1] = cvPoint( img_object.cols, 0 );
-  // obj_corners[2] = cvPoint( img_object.cols, img_object.rows ); obj_corners[3] = cvPoint( 0, img_object.rows );
-  // std::vector<Point2f> scene_corners(4);
-
-  // perspectiveTransform( obj_corners, scene_corners, H);
-
-  // //-- Draw lines between the corners (the mapped object in the scene - image_2 )
-  // line( img_matches, scene_corners[0] + Point2f( img_object.cols, 0), scene_corners[1] + Point2f( img_object.cols, 0), Scalar(0, 255, 0), 4 );
-  // line( img_matches, scene_corners[1] + Point2f( img_object.cols, 0), scene_corners[2] + Point2f( img_object.cols, 0), Scalar( 0, 255, 0), 4 );
-  // line( img_matches, scene_corners[2] + Point2f( img_object.cols, 0), scene_corners[3] + Point2f( img_object.cols, 0), Scalar( 0, 255, 0), 4 );
-  // line( img_matches, scene_corners[3] + Point2f( img_object.cols, 0), scene_corners[0] + Point2f( img_object.cols, 0), Scalar( 0, 255, 0), 4 );
-
-  // //-- Show detected matches
-  // imshow( "Good Matches & Object detection", img_matches );
-
-  // waitKey(0);
-  // exit(0);
 
   Mat Cm = Mat::zeros(C.T+1, C.T+1, CV_32F);
-  START("Building cost matrix");
-  // "parallel for" shorthand doesn't seem to work for some reason?
-#pragma omp parallel
   {
+    SectionTimer timer("Building cost matrix");
+    // "parallel for" shorthand doesn't seem to work for some reason?
+#pragma omp parallel
+    {
 #pragma omp for schedule(dynamic)
-    for (int i = 1; i <= C.T; i++) {
-      for (int j = i+1; j <= min(i+C.w, C.T); j++) {
-        Cm.at<float>(i, j) =
-          match_cost(C, kps[i-1], features[i-1], kps[j-1], features[j-1]);
-      }
-    }
-  }
-  END;
-
-  START("Finding path");
-  Mat Dv = Mat::zeros(C.T+1, C.T+1, CV_32F);
-  Mat Tv = Mat::zeros(C.T+1, C.T+1, CV_32S);
-
-  // Initialization
-  for (int i = 1; i <= C.g; i++) {
-    for (int j = i+1; j <= i+C.w; j++) {
-      Dv.at<float>(i, j) = Cm.at<float>(i, j) + C.lam_s * vel_cost(i, j);
-    }
-  }
-
-  // First pass: populate Dv
-  for (int i = C.g; i <= C.T; i++) {
-    for (int j = i+1; j <= min(i+C.w, C.T); j++) {
-      float c = Cm.at<float>(i, j) + C.lam_s * vel_cost(i, j);
-      // LOG(INFO) << i << "," << j << ": " << Cm.at<float>(i, j) << " -- " << C.lam_s * vel_cost(i, j);
-      float minv = numeric_limits<float>::max();
-      int mink = 0;
-      for (int k = 1; k <= min(i-1,C.w); k++) {
-        float v = Dv.at<float>(i-k, i) + C.lam_a * acc_cost(i-k, i, j);
-        if (v < minv) {
-          minv = v;
-          mink = k;
+      for (int i = 1; i <= C.T; i++) {
+        for (int j = i+1; j <= min(i+C.w, C.T); j++) {
+          Cm.at<float>(i, j) =
+            match_cost(C, kps[i-1], features[i-1], kps[j-1], features[j-1]);
         }
       }
-      Dv.at<float>(i, j) = c + minv;
-      Tv.at<int>(i, j) = i - mink;
-      //LOG(INFO) << i << "," << j << ": " << i-mink << " -- " << c + minv;
     }
   }
 
-  // Second pass: trace back min cost path
-  int s = 0;
-  int d = 0;
-  float dmin = numeric_limits<float>::max();
-  for (int i = C.T-C.g; i <= C.T; i++) {
-    for (int j = i+1; j <= min(i+C.w, C.T); j++) {
-      float v = Dv.at<float>(i, j);
-      if (v < dmin) {
-        dmin = v;
-        s = i;
-        d = j;
+  vector<int> path;
+  {
+    SectionTimer timer("Finding path");
+    Mat Dv = Mat::zeros(C.T+1, C.T+1, CV_32F);
+    Mat Tv = Mat::zeros(C.T+1, C.T+1, CV_32S);
+
+    // Initialization
+    for (int i = 1; i <= C.g; i++) {
+      for (int j = i+1; j <= i+C.w; j++) {
+        Dv.at<float>(i, j) = Cm.at<float>(i, j) + C.lam_s * vel_cost(i, j);
       }
     }
+
+    // First pass: populate Dv
+    for (int i = C.g; i <= C.T; i++) {
+      for (int j = i+1; j <= min(i+C.w, C.T); j++) {
+        float c = Cm.at<float>(i, j) + C.lam_s * vel_cost(i, j);
+        // LOG(INFO) << i << "," << j << ": " << Cm.at<float>(i, j) << " -- " << C.lam_s * vel_cost(i, j);
+        float minv = numeric_limits<float>::max();
+        int mink = 0;
+        for (int k = 1; k <= min(i-1,C.w); k++) {
+          float v = Dv.at<float>(i-k, i) + C.lam_a * acc_cost(i-k, i, j);
+          if (v < minv) {
+            minv = v;
+            mink = k;
+          }
+        }
+        Dv.at<float>(i, j) = c + minv;
+        Tv.at<int>(i, j) = i - mink;
+        //LOG(INFO) << i << "," << j << ": " << i-mink << " -- " << c + minv;
+      }
+    }
+
+    // Second pass: trace back min cost path
+    int s = 0;
+    int d = 0;
+    float dmin = numeric_limits<float>::max();
+    for (int i = C.T-C.g; i <= C.T; i++) {
+      for (int j = i+1; j <= min(i+C.w, C.T); j++) {
+        float v = Dv.at<float>(i, j);
+        if (v < dmin) {
+          dmin = v;
+          s = i;
+          d = j;
+        }
+      }
+    }
+
+    path.push_back(d);
+    while (s > C.g) {
+      path.insert(path.begin(), s);
+      int b = Tv.at<int>(s, d);
+      d = s;
+      s = b;
+      //LOG(INFO) << d << " --> " << s;
+    }
   }
 
-  LOG(INFO) << s << " " << d << " " << dmin;
-
-  vector<int> path = {d};
-  while (s > C.g) {
-    path.insert(path.begin(), s);
-    int b = Tv.at<int>(s, d);
-    d = s;
-    s = b;
-    LOG(INFO) << d << " --> " << s;
-  }
-  END;
-
-  START("Writing video");
-
-  // For some reason, I can't encode the output with the same codec as the input.
-  // Currently it's hardcoded to a version of h264 that works on OS X. See:
-  // https://gist.github.com/takuma7/44f9ecb028ff00e2132e
-  VideoWriter output(
-    "out.mp4",
-    CV_FOURCC('a','v','c','1'),
-    input.get(CV_CAP_PROP_FPS),
-    Size(input.get(CV_CAP_PROP_FRAME_WIDTH),
-         input.get(CV_CAP_PROP_FRAME_HEIGHT)));
-
-  if (!output.isOpened()) {
-    cerr << "Output failed to open";
-    exit(0);
-  }
-
-  for (int& idx : path) {
+  vector<Mat> optimalFrames;
+  // for (int i = 0; i < frames.size() / 8; i++) {
+  //   optimalFrames.push_back(frames[i * 8]);
+  // }
+  for (int idx : path) {
     LOG(INFO) << idx;
-    output << frames[idx-1];
+    optimalFrames.push_back(frames[idx-1]);
   }
-  END;
+
+#if CV_MAJOR_VERSION >= 3
+  StabilizerBase* stabilizer;
+  {
+    TwoPassStabilizer* twoPass = new TwoPassStabilizer();
+    twoPass->setMotionStabilizer(makePtr<GaussianMotionFilter>(15));
+    stabilizer = twoPass;
+  }
+
+  Ptr<VecSource> source = makePtr<VecSource>(&optimalFrames);
+  stabilizer->setFrameSource(source);
+
+  Ptr<MotionEstimatorRansacL2> est = makePtr<MotionEstimatorRansacL2>(MM_HOMOGRAPHY);
+  Ptr<KeypointBasedMotionEstimatorGpu> kbest = makePtr<KeypointBasedMotionEstimatorGpu>(est);
+  Ptr<IOutlierRejector> outlierRejector = makePtr<NullOutlierRejector>();
+  kbest->setOutlierRejector(outlierRejector);
+  stabilizer->setMotionEstimator(kbest);
+  stabilizer->setRadius(15);
+  stabilizer->setTrimRatio(0.1);
+  stabilizer->setBorderMode(BORDER_REPLICATE);
+
+  Ptr<WeightingDeblurer> deblurer = makePtr<WeightingDeblurer>();
+  deblurer->setRadius(15);
+  deblurer->setSensitivity(0.1);
+  stabilizer->setDeblurer(deblurer);
+
+  Ptr<IFrameSource> stabilizedFrames;
+  stabilizedFrames.reset(dynamic_cast<IFrameSource*>(stabilizer));
+#else
+  cout << "TODO: implement video stabilization for OpenCV 2.x";
+  exit(0);
+#endif
+
+  {
+    SectionTimer timer("Writing video");
+
+    // For some reason, I can't encode the output with the same codec as the input.
+    // Currently it's hardcoded to a version of h264 that works on OS X. See:
+    // https://gist.github.com/takuma7/44f9ecb028ff00e2132e
+    VideoWriter output;
+
+    Mat frame;
+    int count = 0;
+    while (!(frame = stabilizedFrames->nextFrame()).empty()) {
+      if (!output.isOpened()) {
+        LOG(INFO) << frame.rows << " " << frame.cols << " "<< frame.channels();
+
+        output.open(
+          "out.mov",
+          CV_FOURCC('a','v','c','1'),
+          input.get(CV_CAP_PROP_FPS),
+          frame.size());
+      }
+
+      output << frame;
+      count++;
+    }
+  }
 }
