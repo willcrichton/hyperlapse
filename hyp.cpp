@@ -6,6 +6,8 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/videostab.hpp>
 #include <opencv2/xfeatures2d.hpp>
+#include <opencv2/xfeatures2d/cuda.hpp>
+#include <opencv2/cudafeatures2d.hpp>
 
 #include "CycleTimer.h"
 
@@ -16,17 +18,18 @@ using namespace cv::xfeatures2d;
 
 class SectionTimer {
 public:
-  SectionTimer(string name) {
+  SectionTimer(string name) : name(name) {
     LOG(INFO) << name << "...";
     start = CycleTimer::currentSeconds();
   }
 
   ~SectionTimer() {
-    LOG(INFO) << "Done in " << CycleTimer::currentSeconds() - start << "s.";
+    LOG(INFO) << name << " done in " << CycleTimer::currentSeconds() - start << "s.";
   }
 
 private:
   double start;
+  string name;
 };
 
 class Constants {
@@ -37,10 +40,12 @@ public:
   int T;
   int d;
   float tau_c, gamma;
+
   //int lam_s = 200;
   //int lam_a = 80;
   int lam_s = 100;
   int lam_a = 40;
+
   int tau_s = 200;
   int tau_a = 200;
   int v = 8;
@@ -74,12 +79,13 @@ float reprojection_error(vector<Point2f>& src, vector<Point2f>& dst, Mat& H) {
 }
 
 float match_cost(Constants C,
-                 vector<KeyPoint>& kp1, Mat& desc1,
-                 vector<KeyPoint>& kp2, Mat& desc2)
+                 cuda::SURF_CUDA& surf,
+                 Ptr<cuda::DescriptorMatcher>& matcher,
+                 vector<KeyPoint>& kp1, cuda::GpuMat& desc1_gpu,
+                 vector<KeyPoint>& kp2, cuda::GpuMat& desc2_gpu)
 {
-  FlannBasedMatcher matcher;
   vector<DMatch> matches;
-  matcher.match(desc1, desc2, matches);
+  matcher->match(desc1_gpu, desc2_gpu, matches);
 
   double min_dist = numeric_limits<double>::max();
   for (auto& match : matches) {
@@ -162,18 +168,60 @@ int main(int argc, char* argv[]) {
   }
 
   vector<Mat> frames;
+  int minHessian = 400;
+  vector<vector<KeyPoint>> kps;
+  deque<cuda::GpuMat> features;
+  cuda::SURF_CUDA surf(minHessian);
+
+  bool set_constants = false;
+  Constants C(0,0,0);
+
+  Mat Cm = Mat::zeros(C.T+1, C.T+1, CV_32F);
+  int T = 100;
+
   {
     SectionTimer timer("Loading frames");
-    while(true) {
-      Mat frame, frame_t;
+
+    while(frames.size() < T) {
+      Mat frame, frame_t, gray;
+      cuda::GpuMat kp_gpu, feat_gpu, gpu_frame;
       if (!input.read(frame)) { break; }
+
+      if (!set_constants) {
+        C = Constants(frame.cols, frame.rows, T);
+        set_constants = true;
+      }
+
       transpose(frame, frame_t);
+      cvtColor(frame_t, gray, CV_RGB2GRAY);
       frames.push_back(frame_t);
+      gpu_frame.upload(gray);
+
+      vector<KeyPoint> kp;
+      surf(gpu_frame, cuda::GpuMat(), kp_gpu, feat_gpu);
+      surf.downloadKeypoints(kp_gpu, kp);
+      kps.push_back(kp);
+      features.push_back(feat_gpu);
+
+
+      int i = frames.size() - C.w;
+      if (i >= 1) {
+        Ptr<cuda::DescriptorMatcher> matcher =
+          cuda::DescriptorMatcher::createBFMatcher();
+        for (int j = i+1; j <= min(i+C.w, C.T); j++) {
+          Cm.at<float>(i, j) =
+            match_cost(C, surf, matcher, kps[i-1], features[0], kps[j-1], features[j-i-1]);
+        }
+
+        features[0].release();
+        features.pop_front();
+      }
+
+      LOG(INFO) << i << " " << frames.size();
     }
+
     LOG(INFO) << "Loaded " << frames.size() << " frames.";
   }
-
-  Constants C(frames[0].cols, frames[0].rows, frames.size());
 
   auto vel_cost = [&](int i, int j) {
     return std::min(powf((j - i) - C.v, 2), (float) C.tau_s);
@@ -183,52 +231,9 @@ int main(int argc, char* argv[]) {
     return std::min(powf((j - i) - (i - h), 2), (float) C.tau_a);
   };
 
-  vector<Mat> features;
-  vector<vector<KeyPoint>> kps;
-  {
-    SectionTimer timer("Detecting features");
-    for (int i = 0; i < C.T; i++) {
-      Mat feat;
-      vector<KeyPoint> kp;
-      features.push_back(feat);
-      kps.push_back(kp);
-    }
-
-#pragma omp parallel
-    {
-#if CV_MAJOR_VERSION >= 3
-      Ptr<SURF> detector = SURF::create(400);
-#pragma omp for schedule(dynamic)
-      for (int i = 0; i < frames.size(); i++) {
-        detector->detect(frames[i], kps[i]);
-        detector->compute(frames[i], kps[i], features[i]);
-      }
-#else
-      SurfFeatureDetector detector(400);
-      SurfDescriptorExtractor extractor;
-#pragma omp for schedule(dynamic)
-      for (int i = 0; i < frames.size(); i++) {
-        detector.detect(frames[i], kps[i]);
-        extractor.compute(frames[i], kps[i], features[i]);
-      }
-#endif
-    }
-  }
-
-  Mat Cm = Mat::zeros(C.T+1, C.T+1, CV_32F);
-  {
-    SectionTimer timer("Building cost matrix");
-    // "parallel for" shorthand doesn't seem to work for some reason?
-#pragma omp parallel
-    {
-#pragma omp for schedule(dynamic)
-      for (int i = 1; i <= C.T; i++) {
-        for (int j = i+1; j <= min(i+C.w, C.T); j++) {
-          Cm.at<float>(i, j) =
-            match_cost(C, kps[i-1], features[i-1], kps[j-1], features[j-1]);
-        }
-      }
-    }
+  surf.releaseMemory();
+  for (auto& feat : features) {
+    feat.release();
   }
 
   vector<int> path;
@@ -310,10 +315,16 @@ int main(int argc, char* argv[]) {
   stabilizer->setFrameSource(source);
 
   Ptr<MotionEstimatorRansacL2> est = makePtr<MotionEstimatorRansacL2>(MM_HOMOGRAPHY);
-  Ptr<KeypointBasedMotionEstimatorGpu> kbest = makePtr<KeypointBasedMotionEstimatorGpu>(est);
   Ptr<IOutlierRejector> outlierRejector = makePtr<NullOutlierRejector>();
+
+  // No GPU for now since I get OOM error for >1k frames
+  // Ptr<KeypointBasedMotionEstimatorGpu> kbest = makePtr<KeypointBasedMotionEstimatorGpu>(est);
+  Ptr<KeypointBasedMotionEstimator> kbest = makePtr<KeypointBasedMotionEstimator>(est);
+  kbest->setDetector(GFTTDetector::create(1000));
+
   kbest->setOutlierRejector(outlierRejector);
   stabilizer->setMotionEstimator(kbest);
+
   stabilizer->setRadius(15);
   stabilizer->setTrimRatio(0.1);
   stabilizer->setBorderMode(BORDER_REPLICATE);
